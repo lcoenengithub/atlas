@@ -1,6 +1,6 @@
 import { useCallback } from 'react'
 
-import { ExtrinsicFailedError, ExtrinsicResult, ExtrinsicSignCancelledError, ExtrinsicStatus } from '@/joystream-lib'
+import { ExtrinsicContentIds, ExtrinsicResult, ExtrinsicStatus, JoystreamLibErrorType } from '@/joystream-lib'
 import { ConsoleLogger, SentryLogger } from '@/utils/logs'
 
 import { TransactionDialogStep, useTransactionManagerStore } from './store'
@@ -16,8 +16,8 @@ type SuccessMessage = {
 type HandleTransactionOpts<T> = {
   txFactory: (updateStatus: UpdateStatusFn) => Promise<ExtrinsicResult<T>>
   preProcess?: () => void | Promise<void>
-  onTxFinalize?: (data: T) => Promise<unknown>
-  onTxSync?: (data: T) => Promise<unknown>
+  onTxFinalize?: (data: T, contentIds?: ExtrinsicContentIds) => Promise<unknown>
+  onTxSync?: (data: T, contentIds?: ExtrinsicContentIds) => Promise<unknown>
   successMessage: SuccessMessage
 }
 type HandleTransactionFn = <T>(opts: HandleTransactionOpts<T>) => Promise<boolean>
@@ -50,9 +50,9 @@ export const useTransaction = (): HandleTransactionFn => {
 
         // run txFactory and prompt for signature
         setDialogStep(ExtrinsicStatus.Unsigned)
-        const { data: txData, block } = await txFactory(setDialogStep)
+        const { data: txData, block, contentIds } = await txFactory(setDialogStep)
         if (onTxFinalize) {
-          onTxFinalize(txData).catch((error) =>
+          onTxFinalize(txData, contentIds).catch((error) =>
             SentryLogger.error('Failed transaction finalize callback', 'TransactionManager', error)
           )
         }
@@ -62,7 +62,7 @@ export const useTransaction = (): HandleTransactionFn => {
           const syncCallback = async () => {
             if (onTxSync) {
               try {
-                await onTxSync(txData)
+                await onTxSync(txData, contentIds)
               } catch (error) {
                 SentryLogger.error('Failed transaction sync callback', 'TransactionManager', error)
               }
@@ -79,7 +79,8 @@ export const useTransaction = (): HandleTransactionFn => {
           })
         })
       } catch (error) {
-        if (error instanceof ExtrinsicSignCancelledError) {
+        const errorName = error.name as JoystreamLibErrorType
+        if (errorName === 'SignCancelledError') {
           ConsoleLogger.warn('Sign cancelled')
           setDialogStep(null)
           displaySnackbar({
@@ -89,13 +90,12 @@ export const useTransaction = (): HandleTransactionFn => {
           })
           return false
         }
-
-        if (error instanceof ExtrinsicFailedError && !error.voucherSizeLimitExceeded) {
+        if (errorName === 'FailedError') {
           SentryLogger.error('Extrinsic failed', 'TransactionManager', error)
         } else {
           SentryLogger.error('Unknown sendExtrinsic error', 'TransactionManager', error)
         }
-        if (error.voucherSizeLimitExceeded) {
+        if (errorName === 'VoucherLimitError') {
           SentryLogger.message('Voucher size limit exceeded', 'TransactionManager', error)
           setDialogStep(ExtrinsicStatus.VoucherSizeLimitExceeded)
         } else {

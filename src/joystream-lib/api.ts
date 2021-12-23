@@ -29,18 +29,12 @@ import {
   u64 as U64,
   Vec,
 } from '@polkadot/types'
-import { DispatchError } from '@polkadot/types/interfaces/system'
 import BN from 'bn.js'
 
 import { ConsoleLogger, SentryLogger } from '@/utils/logs'
 
-import {
-  AccountNotSelectedError,
-  ApiNotConnectedError,
-  ExtrinsicFailedError,
-  ExtrinsicSignCancelledError,
-  ExtrinsicUnknownError,
-} from './errors'
+import { JoystreamLibError } from './errors'
+import { sendExtrinsicAndParseEvents } from './helpers'
 import {
   AccountId,
   AssetMetadata,
@@ -48,9 +42,12 @@ import {
   ChannelId,
   CreateChannelMetadata,
   CreateVideoMetadata,
+  ExtrinsicChannelContentIds,
   ExtrinsicResult,
   ExtrinsicStatus,
   ExtrinsicStatusCallbackFn,
+  ExtrinsicVideoContentIds,
+  InputAssets,
   MemberId,
   VideoAssets,
   VideoId,
@@ -64,21 +61,18 @@ export class JoystreamJs {
     return this._selectedAccountId
   }
 
-  // if needed these could become some kind of event emitter
-  public onNodeConnectionUpdate?: (connected: boolean) => unknown
-
   /* Lifecycle */
-  constructor(endpoint: string) {
+  constructor(endpoint: string, onNodeConnectionUpdate: (connected: boolean) => void) {
     const provider = new WsProvider(endpoint)
     provider.on('connected', () => {
       this.logConnectionData(endpoint)
-      this.onNodeConnectionUpdate?.(true)
+      onNodeConnectionUpdate?.(true)
     })
     provider.on('disconnected', () => {
-      this.onNodeConnectionUpdate?.(false)
+      onNodeConnectionUpdate?.(false)
     })
     provider.on('error', () => {
-      this.onNodeConnectionUpdate?.(false)
+      onNodeConnectionUpdate?.(false)
     })
 
     this.api = new ApiPromise({ provider, types })
@@ -94,7 +88,7 @@ export class JoystreamJs {
       await this.api.isReady
     } catch (e) {
       SentryLogger.error('Failed to initialize Polkadot API', 'JoystreamJs', e)
-      throw new ApiNotConnectedError()
+      throw new JoystreamLibError({ name: 'ApiNotConnectedError' })
     }
   }
 
@@ -108,74 +102,29 @@ export class JoystreamJs {
     tx: SubmittableExtrinsic<'promise'>,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<GenericEvent[]>> {
-    // async executor necessary here since we're listening for a callback
-    // eslint-disable-next-line no-async-promise-executor
-    return new Promise<ExtrinsicResult<GenericEvent[]>>(async (resolve, reject) => {
-      if (!this.selectedAccountId) {
-        reject(new AccountNotSelectedError())
-        return
+    if (!this.selectedAccountId) {
+      throw new JoystreamLibError({ name: 'AccountNotSelectedError' })
+    }
+
+    try {
+      cb?.(ExtrinsicStatus.Unsigned)
+
+      const { events, blockHash } = await sendExtrinsicAndParseEvents(
+        tx,
+        this.selectedAccountId,
+        this.api.registry as TypeRegistry,
+        cb
+      )
+
+      const blockHeader = await this.api.rpc.chain.getHeader(blockHash)
+
+      return { data: events, block: blockHeader.number.toNumber() }
+    } catch (error) {
+      if (error?.message === 'Cancelled') {
+        throw new JoystreamLibError({ name: 'SignCancelledError' })
       }
-      try {
-        cb?.(ExtrinsicStatus.Unsigned)
-        const unsubscribe = await tx.signAndSend(this.selectedAccountId, (result) => {
-          const { status, isError, events } = result
-
-          if (isError) {
-            reject(new ExtrinsicUnknownError('Unknown extrinsic error!'))
-            unsubscribe()
-            return
-          }
-
-          if (status.isFinalized) {
-            unsubscribe()
-
-            const unpackedEvents = events.map((e) => e.event)
-
-            unpackedEvents
-              .filter((event) => event.section === 'system')
-              .forEach((event) => {
-                if (event.method === 'ExtrinsicFailed') {
-                  const dispatchError = event.data[0] as DispatchError
-                  let errorMsg = dispatchError.toString()
-                  if (dispatchError.isModule) {
-                    try {
-                      // Need to assert that registry is of TypeRegistry type, since Registry interface
-                      // seems outdated and doesn't include DispatchErrorModule as possible argument for "findMetaError"
-                      const { name, documentation } = (this.api.registry as TypeRegistry).findMetaError(
-                        dispatchError.asModule
-                      )
-                      errorMsg = `${name} (${documentation})`
-                    } catch (e) {
-                      // This probably means we don't have this error in the metadata
-                      // In this case - continue (we'll just display dispatchError.toString())
-                    }
-                  }
-                  reject(new ExtrinsicFailedError(event, errorMsg, errorMsg.includes('VoucherSizeLimitExceeded')))
-                } else if (event.method === 'ExtrinsicSuccess') {
-                  const blockHash = status.asFinalized
-                  this.api.rpc.chain
-                    .getHeader(blockHash)
-                    .then(({ number }) => resolve({ block: number.toNumber(), data: unpackedEvents }))
-                    .catch((reason) => reject(new ExtrinsicFailedError(reason)))
-                } else {
-                  SentryLogger.message('Unknown extrinsic event', 'JoystreamJs', 'warning', {
-                    event: { method: event.method },
-                  })
-                }
-              })
-          }
-        })
-
-        // if signAndSend succeeded, report back to the caller with the update
-        cb?.(ExtrinsicStatus.Signed)
-      } catch (e) {
-        if (e?.message === 'Cancelled') {
-          reject(new ExtrinsicSignCancelledError())
-          return
-        }
-        reject(e)
-      }
-    })
+      throw error
+    }
   }
 
   private async _createOrUpdateVideo(
@@ -184,6 +133,7 @@ export class JoystreamJs {
     channelId: ChannelId,
     inputMetadata: CreateVideoMetadata,
     inputAssets: VideoAssets,
+    contentIds?: ExtrinsicVideoContentIds,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<VideoId>> {
     const newVideo = updatedVideoId === null
@@ -301,6 +251,7 @@ export class JoystreamJs {
     return {
       data: new BN(videoId as never).toString(),
       block,
+      contentIds,
     }
   }
 
@@ -309,6 +260,7 @@ export class JoystreamJs {
     memberId: MemberId,
     inputMetadata: CreateChannelMetadata,
     inputAssets: ChannelAssets,
+    contentIds?: ExtrinsicChannelContentIds,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<ChannelId>> {
     const newChannel = updatedChannelId == null
@@ -385,6 +337,7 @@ export class JoystreamJs {
     return {
       data: new BN(channelId as never).toString(),
       block,
+      contentIds,
     }
   }
 
@@ -398,7 +351,6 @@ export class JoystreamJs {
       SentryLogger.error('Missing signer for setActiveAccount', 'JoystreamJs')
       return
     }
-
     this._selectedAccountId = accountId
     this.api.setSigner(signer)
   }
@@ -411,7 +363,7 @@ export class JoystreamJs {
     return new BN(balance.freeBalance).toNumber()
   }
 
-  createFileAsset({ ipfsContentId, size }: AssetMetadata): [NewAsset, string] {
+  private _createFileAsset({ ipfsContentId, size }: AssetMetadata): [NewAsset, string] {
     const contentId = ContentId.generate(this.api.registry)
     const b = new Bytes(this.api.registry, ipfsContentId)
     const content = new ContentParameters(this.api.registry, {
@@ -424,52 +376,129 @@ export class JoystreamJs {
     return [new NewAsset(this.api.registry, { upload: content }), contentId.encode()]
   }
 
+  private _prepareChannelAssets(inputAssets: InputAssets) {
+    return {
+      avatarContent: inputAssets.avatar && this._createFileAsset(inputAssets.avatar),
+      coverContent: inputAssets.cover && this._createFileAsset(inputAssets.cover),
+    }
+  }
+
   async createChannel(
     memberId: MemberId,
     inputMetadata: CreateChannelMetadata,
-    inputAssets: ChannelAssets,
+    inputAssets: InputAssets,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<ChannelId>> {
+    const { avatarContent, coverContent } = this._prepareChannelAssets(inputAssets)
+    const assets: { [field: string]: [NewAsset, string] | undefined } = {
+      avatarAsset: avatarContent || undefined,
+      coverAsset: coverContent || undefined,
+    }
+    const contentIds = {
+      avatarId: assets.avatarAsset ? assets.avatarAsset[1] : '',
+      coverId: assets.coverAsset ? assets.coverAsset[1] : '',
+    }
     await this.ensureApi()
 
-    return this._createOrUpdateChannel(null, memberId, inputMetadata, inputAssets, cb)
+    return this._createOrUpdateChannel(
+      null,
+      memberId,
+      inputMetadata,
+      { avatar: assets.avatarAsset && assets.avatarAsset[0], cover: assets.coverAssets && assets.coverAssets[0] },
+      contentIds,
+      cb
+    )
   }
 
   async updateChannel(
     channelId: ChannelId,
     memberId: MemberId,
     inputMetadata: CreateChannelMetadata,
-    inputAssets: ChannelAssets,
+    inputAssets: InputAssets,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<ChannelId>> {
+    const { avatarContent, coverContent } = this._prepareChannelAssets(inputAssets)
+    const assets: { [field: string]: [NewAsset, string] | undefined } = {
+      avatarAsset: avatarContent || undefined,
+      coverAsset: coverContent || undefined,
+    }
+    const contentIds = {
+      avatarId: assets.avatarAsset ? assets.avatarAsset[1] : '',
+      coverId: assets.coverAsset ? assets.coverAsset[1] : '',
+    }
     await this.ensureApi()
 
-    return this._createOrUpdateChannel(channelId, memberId, inputMetadata, inputAssets, cb)
+    return this._createOrUpdateChannel(
+      channelId,
+      memberId,
+      inputMetadata,
+      { avatar: assets.avatarAsset && assets.avatarAsset[0], cover: assets.coverAssets && assets.coverAssets[0] },
+      contentIds,
+      cb
+    )
+  }
+
+  private _prepareVideoAssets(inputAssets: InputAssets) {
+    return {
+      videoContent: inputAssets.video ? this._createFileAsset(inputAssets.video) : [],
+      thumbnailContent: inputAssets.thumbnail ? this._createFileAsset(inputAssets.thumbnail) : [],
+    }
   }
 
   async createVideo(
     memberId: MemberId,
     channelId: ChannelId,
     inputMetadata: CreateVideoMetadata,
-    inputAssets: VideoAssets,
+    inputAssets: InputAssets,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<VideoId>> {
-    await this.ensureApi()
+    const {
+      videoContent: [video, videoId],
+      thumbnailContent: [thumbnail, thumbnailId],
+    } = this._prepareVideoAssets(inputAssets)
 
-    return this._createOrUpdateVideo(null, memberId, channelId, inputMetadata, inputAssets, cb)
+    return this._createOrUpdateVideo(
+      null,
+      memberId,
+      channelId,
+      inputMetadata,
+      { video, thumbnail },
+      { videoId, thumbnailId },
+      cb
+    )
   }
 
   async updateVideo(
-    videoId: VideoId,
+    updatedVideoId: VideoId,
     memberId: MemberId,
     channelId: ChannelId,
     inputMetadata: CreateVideoMetadata,
-    inputAssets: VideoAssets,
+    inputAssets: InputAssets,
     cb?: ExtrinsicStatusCallbackFn
   ): Promise<ExtrinsicResult<VideoId>> {
+    const { videoContent, thumbnailContent } = this._prepareVideoAssets(inputAssets)
+    const assets: { [field: string]: [NewAsset, string] | never[] } = {
+      videoAsset: videoContent || [],
+      thumbnailAsset: thumbnailContent || [],
+    }
+    const contentIds = {
+      videoId: assets.videoAsset ? assets.videoAsset[1] : '',
+      thumbnailId: assets.thumbnailAsset ? assets.thumbnailAsset[1] : '',
+    }
     await this.ensureApi()
 
-    return this._createOrUpdateVideo(videoId, memberId, channelId, inputMetadata, inputAssets, cb)
+    return this._createOrUpdateVideo(
+      updatedVideoId,
+      memberId,
+      channelId,
+      inputMetadata,
+      {
+        video: assets.videoAsset && assets.videoAsset[0],
+        thumbnail: assets.thumbnailAsset && assets.thumbnailAsset[0],
+      },
+      contentIds,
+      cb
+    )
   }
 
   async deleteVideo(

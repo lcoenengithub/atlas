@@ -9,7 +9,7 @@ import { useAuthorizedUser } from '@/providers/user'
 import { removeVideoFromCache } from '@/utils/cachingAssets'
 
 export const useDeleteVideo = () => {
-  const { joystream } = useJoystream()
+  const { joystream, proxyCallback } = useJoystream()
   const handleTransaction = useTransaction()
   const { activeMemberId } = useAuthorizedUser()
   const removeAssetsWithParentFromUploads = useUploadsStore((state) => state.actions.removeAssetsWithParentFromUploads)
@@ -24,7 +24,8 @@ export const useDeleteVideo = () => {
       }
 
       handleTransaction({
-        txFactory: (updateStatus) => joystream.deleteVideo(videoId, activeMemberId, updateStatus),
+        txFactory: async (updateStatus) =>
+          await joystream.deleteVideo(videoId, activeMemberId, proxyCallback(updateStatus)),
         onTxSync: async () => {
           removeVideoFromCache(videoId, client)
           removeAssetsWithParentFromUploads('video', videoId)
@@ -36,7 +37,7 @@ export const useDeleteVideo = () => {
         },
       })
     },
-    [activeMemberId, client, handleTransaction, joystream, removeAssetsWithParentFromUploads]
+    [activeMemberId, client, handleTransaction, joystream, proxyCallback, removeAssetsWithParentFromUploads]
   )
 
   const deleteVideo = useCallback(

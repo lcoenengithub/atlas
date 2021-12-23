@@ -23,7 +23,7 @@ import {
 import { languages } from '@/config/languages'
 import { absoluteRoutes } from '@/config/routes'
 import { useDisplayDataLostWarning } from '@/hooks/useDisplayDataLostWarning'
-import { ChannelAssets, ChannelId, CreateChannelMetadata } from '@/joystream-lib'
+import { ChannelId, CreateChannelMetadata, ExtrinsicContentIds, InputAssets } from '@/joystream-lib'
 import { AssetType, useAsset, useAssetStore, useRawAsset } from '@/providers/assets'
 import { useConnectionStatusStore } from '@/providers/connectionStatus'
 import { useJoystream } from '@/providers/joystream'
@@ -82,7 +82,7 @@ export const CreateEditChannelView: React.FC<CreateEditChannelViewProps> = ({ ne
   const [coverHashPromise, setCoverHashPromise] = useState<Promise<string> | null>(null)
 
   const { activeMemberId, activeChannelId, setActiveUser, refetchActiveMembership } = useUser()
-  const { joystream } = useJoystream()
+  const { joystream, proxyCallback } = useJoystream()
   const handleTransaction = useTransaction()
   const { displaySnackbar } = useSnackbar()
   const nodeConnectionStatus = useConnectionStatusStore((state) => state.nodeConnectionStatus)
@@ -244,35 +244,29 @@ export const CreateEditChannelView: React.FC<CreateEditChannelViewProps> = ({ ne
       ...(dirtyFields.isPublic || newChannel ? { isPublic: data.isPublic } : {}),
     }
 
-    const assets: ChannelAssets = {}
-    let avatarContentId = ''
-    let coverContentId = ''
+    const assets: InputAssets = {}
 
     const processAssets = async () => {
       if (dirtyFields.avatar && avatarAsset?.blob && avatarHashPromise) {
-        const [asset, contentId] = joystream.createFileAsset({
+        assets.avatar = {
           size: avatarAsset.blob.size,
           ipfsContentId: await avatarHashPromise,
-        })
-        assets.avatar = asset
-        avatarContentId = contentId
+        }
       }
 
       if (dirtyFields.cover && coverAsset?.blob && coverHashPromise) {
-        const [asset, contentId] = joystream.createFileAsset({
-          size: coverAsset?.blob.size,
+        assets.cover = {
+          size: coverAsset.blob.size,
           ipfsContentId: await coverHashPromise,
-        })
-        assets.cover = asset
-        coverContentId = contentId
+        }
       }
     }
 
-    const uploadAssets = async (channelId: ChannelId) => {
+    const uploadAssets = async (channelId: ChannelId, contentIds?: ExtrinsicContentIds) => {
       const uploadPromises: Promise<unknown>[] = []
-      if (avatarAsset?.blob && avatarContentId) {
+      if (avatarAsset?.blob && contentIds?.avatarId) {
         const uploadPromise = startFileUpload(avatarAsset.blob, {
-          contentId: avatarContentId,
+          contentId: contentIds.avatarId,
           owner: channelId,
           parentObject: {
             type: 'channel',
@@ -284,9 +278,9 @@ export const CreateEditChannelView: React.FC<CreateEditChannelViewProps> = ({ ne
         })
         uploadPromises.push(uploadPromise)
       }
-      if (coverAsset?.blob && coverContentId) {
+      if (coverAsset?.blob && contentIds?.coverId) {
         const uploadPromise = startFileUpload(coverAsset.blob, {
-          contentId: coverContentId,
+          contentId: contentIds?.coverId,
           owner: channelId,
           parentObject: {
             type: 'channel',
@@ -303,12 +297,12 @@ export const CreateEditChannelView: React.FC<CreateEditChannelViewProps> = ({ ne
       )
     }
 
-    const refetchDataAndCacheAssets = async (channelId: ChannelId) => {
-      if (avatarContentId && avatarAsset?.url) {
-        addAsset(avatarContentId, { url: avatarAsset.url })
+    const refetchDataAndCacheAssets = async (channelId: ChannelId, contentIds?: ExtrinsicContentIds) => {
+      if (contentIds?.avatarId && avatarAsset?.url) {
+        addAsset(contentIds?.avatarId, { url: avatarAsset.url })
       }
-      if (coverContentId && coverAsset?.url) {
-        addAsset(coverContentId, { url: coverAsset.url })
+      if (contentIds?.coverId && coverAsset?.url) {
+        addAsset(contentIds?.coverId, { url: coverAsset.url })
       }
 
       const refetchPromiseList = [refetchActiveMembership(), ...(!newChannel ? [refetchChannel()] : [])]
@@ -323,8 +317,14 @@ export const CreateEditChannelView: React.FC<CreateEditChannelViewProps> = ({ ne
       preProcess: processAssets,
       txFactory: (updateStatus) =>
         newChannel
-          ? joystream.createChannel(activeMemberId, metadata, assets, updateStatus)
-          : joystream.updateChannel(activeChannelId ?? '', activeMemberId, metadata, assets, updateStatus),
+          ? joystream.createChannel(activeMemberId, metadata, assets, proxyCallback(updateStatus))
+          : joystream.updateChannel(
+              activeChannelId ?? '',
+              activeMemberId,
+              metadata,
+              assets,
+              proxyCallback(updateStatus)
+            ),
       onTxFinalize: uploadAssets,
       onTxSync: refetchDataAndCacheAssets,
       successMessage: {

@@ -29,6 +29,18 @@ export type VideoAssets = {
   video?: NewAsset
 }
 
+export type ExtrinsicChannelContentIds = {
+  avatarId?: string
+  coverId?: string
+}
+
+export type ExtrinsicVideoContentIds = {
+  videoId?: string
+  thumbnailId?: string
+}
+
+export type ExtrinsicContentIds = ExtrinsicChannelContentIds & ExtrinsicVideoContentIds
+
 export enum ExtrinsicStatus {
   ProcessingAssets,
   Unsigned,
@@ -42,4 +54,17 @@ export type ExtrinsicStatusCallbackFn = (status: ExtrinsicStatus.Unsigned | Extr
 export type ExtrinsicResult<T> = {
   block: number
   data: T
+  contentIds?: ExtrinsicContentIds
 }
+
+type VideoInputAssets = {
+  video?: AssetMetadata
+  thumbnail?: AssetMetadata
+}
+
+type ChannelInputAssets = {
+  avatar?: AssetMetadata
+  cover?: AssetMetadata
+}
+
+export type InputAssets = VideoInputAssets & ChannelInputAssets
